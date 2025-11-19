@@ -27,13 +27,15 @@ pub(crate) fn check_struct_sizes() -> anyhow::Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
 
-    if sizes.seccomp_notif as usize != size_of::<libc::seccomp_notif>() {
-        anyhow::bail!(
-            "seccomp_notif size is {} (expected {})",
-            sizes.seccomp_notif,
-            size_of::<libc::seccomp_notif>()
-        );
-    }
+    assert_eq!(
+        sizes.seccomp_notif as usize,
+        size_of::<libc::seccomp_notif>()
+    );
+    assert_eq!(
+        sizes.seccomp_notif_resp as usize,
+        size_of::<libc::seccomp_notif_resp>()
+    );
+    assert_eq!(sizes.seccomp_data as usize, size_of::<libc::seccomp_data>());
 
     Ok(())
 }
@@ -129,9 +131,12 @@ pub(crate) fn recv(
             args: [0; 6],
         },
     };
-    let recv_ioctl: ioctl::Updater<SECCOMP_IOCTL_NOTIF_RECV, _> =
-        unsafe { ioctl::Updater::new(&mut notif) };
-    unsafe { ioctl::ioctl(seccomp, recv_ioctl)? };
+
+    unsafe {
+        let recv_ioctl: ioctl::Updater<SECCOMP_IOCTL_NOTIF_RECV, _> =
+            ioctl::Updater::new(&mut notif);
+        ioctl::ioctl(seccomp, recv_ioctl)?;
+    }
 
     let [fd, bind_addr, len, ..] = notif.data.args;
     assert!(len as usize == size_of::<libc::sockaddr_in>());
@@ -178,9 +183,11 @@ pub(crate) fn recv(
             newfd_flags: 0,
         };
 
-        let addfd_ioctl: ioctl::Setter<SECCOMP_IOCTL_NOTIF_ADDFD, _> =
-            unsafe { ioctl::Setter::new(notif_addfd) };
-        unsafe { ioctl::ioctl(seccomp, addfd_ioctl)? };
+        unsafe {
+            let addfd_ioctl: ioctl::Setter<SECCOMP_IOCTL_NOTIF_ADDFD, _> =
+                ioctl::Setter::new(notif_addfd);
+            ioctl::ioctl(seccomp, addfd_ioctl)?;
+        }
 
         libc::seccomp_notif_resp {
             id: notif.id,
@@ -197,9 +204,11 @@ pub(crate) fn recv(
         }
     };
 
-    let send_ioctl: ioctl::Setter<SECCOMP_IOCTL_NOTIF_SEND, _> =
-        unsafe { ioctl::Setter::new(notif_resp) };
-    unsafe { ioctl::ioctl(seccomp, send_ioctl)? };
+    unsafe {
+        let send_ioctl: ioctl::Setter<SECCOMP_IOCTL_NOTIF_SEND, _> =
+            ioctl::Setter::new(notif_resp);
+        ioctl::ioctl(seccomp, send_ioctl)?;
+    }
 
     Ok(())
 }
