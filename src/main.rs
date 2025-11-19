@@ -24,14 +24,13 @@ impl ErrBuf {
         }
     }
 
-    fn push(&mut self, e: anyhow::Error) -> Option<(anyhow::Error, Instant)> {
-        let el = self.buf[self.idx as usize].replace((e, Instant::now()));
-        self.idx = (self.idx + 1) % self.buf.len() as u8;
-        el
-    }
-
-    fn next(&mut self) -> Option<(anyhow::Error, Instant)> {
-        let el = self.buf[self.idx as usize].take();
+    fn push(
+        &mut self,
+        e: Option<(anyhow::Error, Instant)>,
+    ) -> Option<(anyhow::Error, Instant)> {
+        let curr = &mut self.buf[self.idx as usize];
+        let el = curr.take();
+        *curr = e;
         self.idx = (self.idx + 1) % self.buf.len() as u8;
         el
     }
@@ -267,8 +266,11 @@ fn main() -> anyhow::Result<()> {
         for i in indices {
             let e = &mut endpoints[i];
             if let Err(curr_err) = update_endpoint(e) {
-                if let Some((first_err, first_time)) = e.errs.push(curr_err) {
-                    let timeframe = Instant::now() - first_time;
+                let now = Instant::now();
+                if let Some((first_err, first_time)) =
+                    e.errs.push(Some((curr_err, now)))
+                {
+                    let timeframe = now - first_time;
                     if timeframe > std::time::Duration::new(5, 0) {
                         continue;
                     }
@@ -284,7 +286,7 @@ fn main() -> anyhow::Result<()> {
                         e.port,
                         e.cmd,
                     );
-                    while let Some((err, t)) = e.errs.next() {
+                    while let Some((err, t)) = e.errs.push(None) {
                         eprintln!(
                             "    {:?} ms: {}",
                             (t - first_time).as_millis(),
