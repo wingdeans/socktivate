@@ -1,7 +1,7 @@
 mod config;
 mod seccomp;
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::time::Instant;
 
@@ -9,6 +9,7 @@ use rustix::event;
 use rustix::event::{PollFd, PollFlags};
 use rustix::net;
 use rustix::process;
+use rustix::time;
 
 #[derive(Debug)]
 struct ErrBuf {
@@ -47,7 +48,15 @@ enum State {
         seccomp: OwnedFd,
         seccomp_in: PollFlags,
     },
-    Started {},
+    Started {
+        timer: OwnedFd,
+        timer_in: PollFlags,
+    },
+    Idle {
+        sock_in: PollFlags,
+        timer: OwnedFd,
+        timer_in: PollFlags,
+    },
 }
 
 #[derive(Debug)]
@@ -62,6 +71,54 @@ struct Endpoint {
     errs: ErrBuf,
     // State
     state: State,
+}
+
+const TIMEOUT_STARTED: event::Secs = 60;
+const TIMEOUT_IDLE: event::Secs = 5 * 60;
+
+fn timerfd(seconds: event::Secs) -> anyhow::Result<OwnedFd> {
+    let timer = time::timerfd_create(
+        time::TimerfdClockId::Monotonic,
+        time::TimerfdFlags::CLOEXEC,
+    )?;
+    time::timerfd_settime(
+        &timer,
+        time::TimerfdTimerFlags::empty(),
+        &time::Itimerspec {
+            it_interval: time::Timespec::default(),
+            it_value: time::Timespec {
+                tv_sec: seconds,
+                tv_nsec: 0,
+            },
+        },
+    )?;
+
+    Ok(timer)
+}
+
+fn signalfd() -> anyhow::Result<OwnedFd> {
+    unsafe {
+        let mut mask = std::mem::MaybeUninit::zeroed().assume_init();
+
+        if libc::sigemptyset(&mut mask) == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if libc::sigaddset(&mut mask, libc::SIGTERM) == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        // Rust resets the signal mask when spawning child processes
+        // so it is not necessary to do manually after fork
+        if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) == -1
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        match libc::signalfd(-1, &mask, libc::SFD_CLOEXEC) {
+            -1 => Err(std::io::Error::last_os_error().into()),
+            fd => Ok(OwnedFd::from_raw_fd(fd)),
+        }
+    }
 }
 
 fn update_endpoint(e: &mut Endpoint) -> anyhow::Result<()> {
@@ -101,6 +158,9 @@ fn update_endpoint(e: &mut Endpoint) -> anyhow::Result<()> {
                 let seccomp_owned = seccomp::register()?;
                 let rights = [seccomp_owned.as_fd()];
                 anc_buf.push(net::SendAncillaryMessage::ScmRights(&rights));
+                // It isn't portable to send ancillary data with no
+                // data over a unix datagram socket, but it works on
+                // Linux (see unix(7): Ancillary messages).
                 net::sendmsg(
                     &ipc_child,
                     &[],
@@ -163,14 +223,46 @@ fn update_endpoint(e: &mut Endpoint) -> anyhow::Result<()> {
             seccomp,
             seccomp_in,
         } => {
+            assert!(seccomp_in.contains(PollFlags::IN));
+
             seccomp::recv(
                 seccomp.as_fd(),
                 e.sock.as_ref().unwrap().as_fd(),
                 e.port,
             )?;
-            e.state = State::Started {};
+
+            e.state = State::Started {
+                timer: timerfd(TIMEOUT_STARTED)?,
+                timer_in: PollFlags::empty(),
+            };
         }
-        State::Started {} => {}
+        State::Started { timer: _, timer_in } => {
+            assert!(timer_in.contains(PollFlags::IN));
+
+            e.state = State::Idle {
+                sock_in: PollFlags::empty(),
+                timer: timerfd(TIMEOUT_IDLE)?,
+                timer_in: PollFlags::empty(),
+            };
+        }
+        State::Idle {
+            sock_in,
+            timer: _,
+            timer_in,
+        } => {
+            e.state = if sock_in.contains(PollFlags::IN) {
+                State::Started {
+                    timer: timerfd(TIMEOUT_STARTED)?,
+                    timer_in: PollFlags::empty(),
+                }
+            } else if timer_in.contains(PollFlags::IN) {
+                let (pidfd, _) = e.pidfd.as_ref().unwrap();
+                process::pidfd_send_signal(pidfd, process::Signal::TERM)?;
+                State::Stopped
+            } else {
+                unreachable!()
+            }
+        }
     }
 
     Ok(())
@@ -211,6 +303,8 @@ fn main() -> anyhow::Result<()> {
 
     seccomp::check_struct_sizes()?;
 
+    let sfd = signalfd()?;
+
     loop {
         // Construct poll fd list based on each endpoint state
         let mut fds: Vec<PollFd> = Vec::new();
@@ -241,12 +335,35 @@ fn main() -> anyhow::Result<()> {
                     fds.push(PollFd::new(seccomp, PollFlags::IN));
                     flags.push((i, Some(seccomp_in)));
                 }
-                State::Started {} => {}
+                State::Started { timer, timer_in } => {
+                    fds.push(PollFd::new(timer, PollFlags::IN));
+                    flags.push((i, Some(timer_in)));
+                }
+                State::Idle {
+                    sock_in,
+                    timer,
+                    timer_in,
+                } => {
+                    fds.extend([
+                        PollFd::new(sock, PollFlags::IN),
+                        PollFd::new(timer, PollFlags::IN),
+                    ]);
+                    flags.extend([(i, Some(sock_in)), (i, Some(timer_in))]);
+                }
             }
         }
+        fds.push(PollFd::new(&sfd, PollFlags::IN)); // signalfd is last, unpaired
 
         // Write endpoints/fds with events
         let cnt = event::poll(&mut fds, None)?;
+
+        // Handle signalfd (SIGINT) separately
+        if let Some(sfd) = fds.pop()
+            && sfd.revents().contains(PollFlags::IN)
+        {
+            break;
+        }
+
         let mut indices: Vec<usize> = Vec::new();
         for ((i, flag), fd) in flags
             .into_iter()
@@ -300,4 +417,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    Ok(())
 }

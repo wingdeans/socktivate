@@ -3,10 +3,13 @@
 stateDiagram-v2
     [*] --> Stopped
     Stopped --> NeedSeccompFd: socket
-    NeedSeccompFd --> [*]: pidfd, timeout
+    NeedSeccompFd --> [*]: pidfd
     NeedSeccompFd --> NeedSeccompNotify: unix socket
     NeedSeccompNotify --> Started: seccomp
-    NeedSeccompNotify --> [*]: pidfd, timeout
+    NeedSeccompNotify --> [*]: pidfd
+    Started --> Idle: timer
+    Idle --> Started: socket
+    Idle --> [*]: timer
     Started --> [*]: pidfd
 ```
 

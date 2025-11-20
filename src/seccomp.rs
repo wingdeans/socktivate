@@ -157,6 +157,8 @@ pub(crate) fn recv(
         iov_len: size_of::<libc::sockaddr_in>(),
     };
 
+    // Partial transfers apply at the granularity of iovec elements,
+    // so return should be -1 or len(iovec[0])
     match unsafe {
         libc::process_vm_readv(
             notif.pid.try_into()?,
