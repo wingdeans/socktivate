@@ -9,7 +9,7 @@ const SECCOMP_IOCTL_NOTIF_SEND: ioctl::Opcode =
 const SECCOMP_IOCTL_NOTIF_ADDFD: ioctl::Opcode =
     ioctl::opcode::write::<libc::seccomp_notif_addfd>(b'!', 3);
 
-pub(crate) fn check_struct_sizes() -> anyhow::Result<()> {
+pub(crate) fn check_struct_sizes() -> std::io::Result<()> {
     let mut sizes = libc::seccomp_notif_sizes {
         seccomp_notif: 0,
         seccomp_notif_resp: 0,
@@ -24,7 +24,7 @@ pub(crate) fn check_struct_sizes() -> anyhow::Result<()> {
         )
     } == -1
     {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(std::io::Error::last_os_error());
     }
 
     assert_eq!(

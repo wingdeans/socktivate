@@ -76,7 +76,7 @@ struct Endpoint {
 const TIMEOUT_STARTED: event::Secs = 60;
 const TIMEOUT_IDLE: event::Secs = 5 * 60;
 
-fn timerfd(seconds: event::Secs) -> anyhow::Result<OwnedFd> {
+fn timerfd(seconds: event::Secs) -> std::io::Result<OwnedFd> {
     let timer = time::timerfd_create(
         time::TimerfdClockId::Monotonic,
         time::TimerfdFlags::CLOEXEC,
@@ -101,10 +101,10 @@ fn sigmask_sigint(how: libc::c_int) -> std::io::Result<libc::sigset_t> {
         let mut mask = std::mem::MaybeUninit::zeroed().assume_init();
 
         if libc::sigemptyset(&mut mask) == -1 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(std::io::Error::last_os_error());
         }
         if libc::sigaddset(&mut mask, libc::SIGTERM) == -1 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(std::io::Error::last_os_error());
         }
 
         // Signal masks are inherited, so it must be reset after fork
