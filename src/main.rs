@@ -96,7 +96,7 @@ fn timerfd(seconds: event::Secs) -> anyhow::Result<OwnedFd> {
     Ok(timer)
 }
 
-fn signalfd() -> anyhow::Result<OwnedFd> {
+fn sigmask_sigint(how: libc::c_int) -> std::io::Result<libc::sigset_t> {
     unsafe {
         let mut mask = std::mem::MaybeUninit::zeroed().assume_init();
 
@@ -107,17 +107,12 @@ fn signalfd() -> anyhow::Result<OwnedFd> {
             return Err(std::io::Error::last_os_error().into());
         }
 
-        // Rust resets the signal mask when spawning child processes
-        // so it is not necessary to do manually after fork
-        if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) == -1
-        {
-            return Err(std::io::Error::last_os_error().into());
+        // Signal masks are inherited, so it must be reset after fork
+        if libc::sigprocmask(how, &mask, std::ptr::null_mut()) == -1 {
+            return Err(std::io::Error::last_os_error());
         }
 
-        match libc::signalfd(-1, &mask, libc::SFD_CLOEXEC) {
-            -1 => Err(std::io::Error::last_os_error().into()),
-            fd => Ok(OwnedFd::from_raw_fd(fd)),
-        }
+        Ok(mask)
     }
 }
 
@@ -150,6 +145,9 @@ fn update_endpoint(e: &mut Endpoint) -> anyhow::Result<()> {
             cmd.args(&e.cmd[1..]);
 
             let pre_exec = move || {
+                // Reset signal mask
+                sigmask_sigint(libc::SIG_UNBLOCK)?;
+
                 // Send seccomp fd over IPC
                 let mut buf = [std::mem::MaybeUninit::uninit();
                     rustix::cmsg_space!(ScmRights(1))];
@@ -303,7 +301,16 @@ fn main() -> anyhow::Result<()> {
 
     seccomp::check_struct_sizes()?;
 
-    let sfd = signalfd()?;
+    let sfd = unsafe {
+        match libc::signalfd(
+            -1,
+            &sigmask_sigint(libc::SIG_BLOCK)?,
+            libc::SFD_CLOEXEC,
+        ) {
+            -1 => return Err(std::io::Error::last_os_error().into()),
+            fd => OwnedFd::from_raw_fd(fd),
+        }
+    };
 
     loop {
         // Construct poll fd list based on each endpoint state
@@ -416,6 +423,19 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    for e in &endpoints {
+        let Some((pidfd, _)) = &e.pidfd else { continue };
+        process::pidfd_send_signal(pidfd, process::Signal::TERM)?;
+    }
+
+    for e in endpoints {
+        let Some((pidfd, _)) = e.pidfd else { continue };
+        process::waitid(
+            process::WaitId::PidFd(pidfd.as_fd()),
+            process::WaitIdOptions::EXITED,
+        )?;
     }
 
     Ok(())
